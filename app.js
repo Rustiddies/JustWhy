@@ -1,8 +1,8 @@
 // WhyMessenger 2.0 – Firebase Auth + Firestore + Storage (SDK 10.12.2, ES modules)
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, updateProfile }
+import { getAuth, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, updateProfile, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, sendPasswordResetEmail }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, doc, setDoc, getDoc, getDocs, updateDoc, collection, query, where, orderBy, limit, onSnapshot, addDoc, serverTimestamp }
+import { getFirestore, doc, setDoc, getDoc, getDocs, updateDoc, collection, query, where, orderBy, limit, onSnapshot, addDoc, serverTimestamp, writeBatch }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 /* ====== KEEP YOUR OWN FIREBASE CONFIG HERE (paste the values you used before) ====== */
@@ -21,7 +21,7 @@ const app = initializeApp(firebaseConfig);          // initialised once
 const auth = getAuth(app), db = getFirestore(app);
 
 const $ = (id) => document.getElementById(id);
-const el = Object.fromEntries(("authScreen appScreen loading tabLogin tabRegister authForm nameField nameInput emailInput passwordInput authError authSubmit " +
+const el = Object.fromEntries(("authScreen appScreen loading tabLogin tabRegister authForm nameField nameInput emailInput passwordInput authError authSubmit googleBtn aiBtn forgotBtn authInfo msgSearchBtn msgSearch " +
   "meBtn meAvatar meName logoutBtn userSearch clearSearch resultsSection resultsList resultsNote recentList recentEmpty emptyState chatPanel backBtn " +
   "peerAvatar peerName peerEmail messages chatError msgForm msgInput sendBtn navHome navSearch navSettings profileDialog pAvatar pEmojis pColors " +
   "pName pEmail pError pSave pCancel").split(" ").map((i) => [i, $(i)]));
@@ -35,13 +35,17 @@ const initial = (s) => (s || "?").trim().charAt(0).toUpperCase() || "?";
 const chatIdFor = (a, b) => [a, b].sort().join("_");
 const HUES = [[239,262],[262,292],[199,239],[320,262],[168,217],[18,330]];
 
-const GRADS = HUES.map((g) => `linear-gradient(135deg,hsl(${g[0]} 85% 62%),hsl(${g[1]} 80% 56%))`);
+const GRADS = ["#5865F2","#EB459E","#23A55A","#F0B232","#ED4245","#00A8FC"];
 // Avatar: chosen emoji (or initial) on a chosen colour
 function paint(node, p) {
   let h = 0; for (const c of p.uid || "") h = (h * 31 + c.charCodeAt(0)) >>> 0;
   const i = Number.isInteger(p.avatarColor) && p.avatarColor >= 0 && p.avatarColor < GRADS.length ? p.avatarColor : h % GRADS.length;
   node.style.background = GRADS[i]; node.replaceChildren();
-  node.textContent = p.avatarEmoji || initial(p.displayName);
+  if (!p.avatarEmoji && p.photoURL) {   // Google photo (only when no emoji chosen)
+    const img = new Image(); img.alt = ""; img.referrerPolicy = "no-referrer";
+    img.onerror = () => { node.replaceChildren(); node.textContent = initial(p.displayName); };
+    img.src = p.photoURL; node.appendChild(img);
+  } else node.textContent = p.avatarEmoji || initial(p.displayName);
 }
 
 function fmtTime(ts) {
@@ -64,6 +68,11 @@ function friendlyError(err) {
     "auth/too-many-requests": "Too many attempts. Wait a moment and try again.",
     "auth/network-request-failed": "Network error. Check your connection.",
     "auth/operation-not-allowed": "Email/Password sign-in is not enabled in Firebase Console.",
+    "auth/unauthorized-domain": "This website's domain isn't authorised. Add it in Firebase → Authentication → Settings → Authorized domains.",
+    "auth/operation-not-allowed": "This sign-in method isn't enabled. Turn it on in Firebase → Authentication → Sign-in method.",
+    "auth/account-exists-with-different-credential": "An account with this email already exists with another sign-in method. Log in with your email and password instead.",
+    "auth/credential-already-in-use": "That Google account is already linked to another WhyMessenger account.",
+    "auth/user-disabled": "This account has been disabled.",
     "permission-denied": "Permission denied by Firestore security rules. Publish the updated firestore.rules."
   };
   return map[err.code] || err.message || "Something went wrong. Please try again.";
@@ -74,9 +83,9 @@ function setMode(next) {
   mode = next;
   el.tabLogin.classList.toggle("active", mode === "login");
   el.tabRegister.classList.toggle("active", mode === "register");
-  show(el.nameField, mode === "register");
+  show(el.nameField, mode === "register"); show(el.forgotBtn, mode === "login"); el.authInfo.textContent = "";
   el.authSubmit.textContent = mode === "login" ? "Log in" : "Create account";
-  el.authError.textContent = "";
+  el.authError.textContent = /^YOUR_/.test(firebaseConfig.apiKey) ? "Firebase config missing: paste your keys at the top of app.js." : "";
 }
 el.tabLogin.onclick = () => setMode("login");
 el.tabRegister.onclick = () => setMode("register");
@@ -102,6 +111,28 @@ el.authForm.addEventListener("submit", async (e) => {
   finally { busyAuth = false; el.authSubmit.disabled = false; }
 });
 
+let googleBusy = false;
+const setGoogleBusy = (b) => { googleBusy = b; el.googleBtn.disabled = b; el.googleBtn.classList.toggle("loading", b); };
+el.googleBtn.onclick = async () => {
+  if (googleBusy) return;                       // prevent duplicate clicks
+  el.authError.textContent = ""; setGoogleBusy(true);
+  const provider = new GoogleAuthProvider(); provider.setCustomParameters({ prompt: "select_account" });
+  try { await signInWithPopup(auth, provider); }   // profile is created/loaded by ensureProfile()
+  catch (err) {
+    console.error(err);
+    if (err.code === "auth/popup-blocked") { try { await signInWithRedirect(auth, provider); return; } catch (e2) { el.authError.textContent = friendlyError(e2); return; } }
+    if (!["auth/popup-closed-by-user", "auth/cancelled-popup-request"].includes(err.code)) el.authError.textContent = friendlyError(err);
+  } finally { setGoogleBusy(false); }
+};
+getRedirectResult(auth).catch((err) => { console.error(err); el.authError.textContent = friendlyError(err); });
+
+el.forgotBtn.onclick = async () => {
+  const email = el.emailInput.value.trim(); el.authError.textContent = ""; el.authInfo.textContent = "";
+  if (!email) { el.authError.textContent = "Enter your email above, then click “Forgot your password?”."; return; }
+  try { await sendPasswordResetEmail(auth, email); el.authInfo.textContent = "Password reset email sent. Check your inbox."; }
+  catch (err) { el.authError.textContent = friendlyError(err); }
+};
+
 function renderMe() {
   if (!myProfile) return;
   el.meName.textContent = myProfile.displayName || "You";
@@ -113,9 +144,16 @@ async function ensureProfile(user) {
   if (busyAuth && mode === "register") return;     // registration writes its own profile
   try {
     const r = doc(db, "users", user.uid), s = await getDoc(r);
-    if (s.exists()) myProfile = { ...s.data(), uid: user.uid };
-    else {
-      const p = { uid: user.uid, displayName: user.displayName || (user.email || "").split("@")[0], email: user.email };
+    const google = user.providerData.some((p) => p.providerId === "google.com");
+    const gPhoto = google && /^https:\/\/[a-z0-9-]+\.googleusercontent\.com\//.test(user.photoURL || "") ? user.photoURL : "";
+    if (s.exists()) {     // existing user: never overwrite name/avatar; only fill what is missing
+      const d = s.data(), fix = {};
+      if (d.photoURL === undefined && gPhoto && !d.avatarEmoji) fix.photoURL = gPhoto;
+      if (Object.keys(fix).length) await updateDoc(r, fix).catch((e) => console.warn("Profile fill skipped:", e.code));
+      myProfile = { ...d, ...fix, uid: user.uid };
+    } else {              // genuinely new user (email or Google)
+      const p = { uid: user.uid, displayName: (user.displayName || (user.email || "").split("@")[0] || "User").slice(0, 60), email: user.email };
+      if (gPhoto) p.photoURL = gPhoto;
       await setDoc(r, { ...p, createdAt: serverTimestamp() }); myProfile = p;
     }
     renderMe();
@@ -223,7 +261,7 @@ async function selectUser(user) {
   if (!me) return;
   const token = ++selectToken;
   if (unsubMessages) { unsubMessages(); unsubMessages = null; }
-  peer = user; el.chatError.textContent = "";
+  peer = user; el.chatError.textContent = ""; forceBottom = true; el.msgSearch.value = ""; el.msgSearch.classList.add("hidden");
   el.peerName.textContent = user.displayName || "Unnamed"; el.peerEmail.textContent = user.email || "";
   paint(el.peerAvatar, user);
   show(el.emptyState, false); show(el.chatPanel, true);
@@ -237,10 +275,45 @@ async function selectUser(user) {
   if (token !== selectToken) return;
   const q = query(collection(db, "chats", chatId, "messages"), orderBy("createdAt", "desc"), limit(100));
   unsubMessages = onSnapshot(q, (snap) => {
-    if (token === selectToken) renderMessages(snap.docs.map((d) => d.data({ serverTimestamps: "estimate" })).reverse());
+    if (token !== selectToken) return;
+    const list = snap.docs.map((d) => ({ ...d.data({ serverTimestamps: "estimate" }), id: d.id })).reverse();
+    renderMessages(list); markRead(chatId, list);
   }, (err) => { console.error(err); if (token === selectToken) el.chatError.textContent = friendlyError(err); });
   el.msgInput.focus();
 }
+
+// ---------- Hugging Face Transformers.js: sentiment model runs in the browser (no server, no API key) ----------
+let aiOn = false, aiPipe = null, aiLoading = null, lastList = []; const toneCache = new Map();
+function loadTone() {
+  if (!aiLoading) aiLoading = import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.0")
+    .then(({ pipeline }) => pipeline("sentiment-analysis", "Xenova/distilbert-base-uncased-finetuned-sst-2-english", {
+      dtype: "q8", progress_callback: (p) => { if (p.status === "progress") el.aiBtn.textContent = `Loading AI ${Math.round(p.progress || 0)}%`; } }))
+    .then((p) => (aiPipe = p));
+  return aiLoading;
+}
+async function addTone(div, text) {
+  try {
+    if (!toneCache.has(text)) {
+      const r = (await aiPipe(text.slice(0, 400)))[0];
+      toneCache.set(text, r.score < 0.75 ? ["😐", "Neutral"] : r.label === "POSITIVE" ? ["😊", "Positive"] : ["😟", "Negative"]);
+    }
+    const [emoji, label] = toneCache.get(text);
+    const chip = document.createElement("span"); chip.className = "tone"; chip.textContent = emoji;
+    chip.title = label + " (Hugging Face model running on your device)";
+    div.querySelector("small").prepend(chip);
+  } catch (e) { console.warn("Tone analysis failed", e); }
+}
+el.aiBtn.onclick = async () => {
+  if (aiOn) { aiOn = false; el.aiBtn.classList.remove("on"); el.aiBtn.textContent = "✨ AI tone"; el.messages.querySelectorAll(".tone").forEach((n) => n.remove()); return; }
+  el.aiBtn.disabled = true; el.aiBtn.textContent = "Loading AI…"; el.chatError.textContent = "";
+  try {
+    await loadTone(); aiOn = true; el.aiBtn.classList.add("on"); el.aiBtn.textContent = "✨ AI tone: on";
+    if (lastList.length) renderMessages(lastList);
+  } catch (e) {
+    console.error(e); aiLoading = null; el.aiBtn.textContent = "✨ AI tone";
+    el.chatError.textContent = "Couldn't load the Hugging Face model. Check your connection and try again.";
+  } finally { el.aiBtn.disabled = false; }
+};
 
 function dayLabel(d) {
   const t = new Date(), y = new Date(); y.setDate(t.getDate() - 1);
@@ -248,30 +321,59 @@ function dayLabel(d) {
   if (d.toDateString() === y.toDateString()) return "Yesterday";
   return d.toLocaleDateString([], { day: "numeric", month: "long", year: "numeric" });
 }
+let forceBottom = true;
 function renderMessages(list) {
-  el.messages.replaceChildren();
-  if (!list.length) { setNote("No messages yet. Say hello!"); return; }
-  let lastDay = "", lastSender = null;
-  list.forEach((m) => {
+  lastList = list;
+  const box = el.messages, prevTop = box.scrollTop, nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
+  const q = el.msgSearch.value.trim().toLowerCase();
+  const shown = q ? list.filter((m) => (m.text || "").toLowerCase().includes(q)) : list;
+  box.replaceChildren();
+  if (!shown.length) { setNote(q ? "No messages match your search." : "No messages yet. Say hello!"); return; }
+  let lastDay = "", lastSender = null, lastMine = -1;
+  shown.forEach((m, i) => { if (m.senderId === me.uid) lastMine = i; });
+  shown.forEach((m, i) => {
     const d = m.createdAt ? m.createdAt.toDate() : new Date();
     if (d.toDateString() !== lastDay) {
       const s = document.createElement("div"); s.className = "day"; s.textContent = dayLabel(d);
-      el.messages.appendChild(s); lastDay = d.toDateString(); lastSender = null;
+      box.appendChild(s); lastDay = d.toDateString(); lastSender = null;
     }
     const div = document.createElement("div");
     div.className = "msg " + (m.senderId === me.uid ? "sent" : "received") + (m.senderId === lastSender ? " cont" : "");
     const text = document.createElement("span"); text.textContent = m.text;        // XSS-safe
     const time = document.createElement("small"); time.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    div.append(text, time); el.messages.appendChild(div); lastSender = m.senderId;
+    if (i === lastMine) {   // Sent / Seen indicator on my latest message
+      const st = document.createElement("span"); st.className = "status" + (m.readAt ? " seen" : "");
+      st.textContent = m.readAt ? " · ✓✓ Seen" : " · ✓ Sent"; time.append(st);
+    }
+    div.append(text, time); box.appendChild(div); lastSender = m.senderId; if (aiOn) addTone(div, m.text);
   });
-  el.messages.scrollTop = el.messages.scrollHeight;
+  if (forceBottom || nearBottom) { box.scrollTop = box.scrollHeight; forceBottom = false; } else box.scrollTop = prevTop;   // don't yank readers to the bottom
 }
+
+// Read receipts: recipient marks messages as read (rules allow only readAt, once)
+const readSent = new Set();
+function markRead(chatId, list) {
+  if (document.hidden || !me) return;
+  const ids = list.filter((m) => m.senderId !== me.uid && !m.readAt && m.id && !readSent.has(m.id)).map((m) => m.id).slice(0, 100);
+  if (!ids.length) return;
+  const batch = writeBatch(db);
+  ids.forEach((id) => { readSent.add(id); batch.update(doc(db, "chats", chatId, "messages", id), { readAt: serverTimestamp() }); });
+  batch.commit().catch((e) => { ids.forEach((id) => readSent.delete(id)); console.warn("Read receipts not saved (publish the latest firestore.rules):", e.code); });
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden && peer && me) markRead(chatIdFor(me.uid, peer.uid), lastList); });
+
+// In-chat message search (filters the loaded messages)
+el.msgSearchBtn.onclick = () => {
+  const open = el.msgSearch.classList.toggle("hidden") === false;
+  if (open) el.msgSearch.focus(); else { el.msgSearch.value = ""; renderMessages(lastList); }
+};
+el.msgSearch.addEventListener("input", () => renderMessages(lastList));
 
 el.msgForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = el.msgInput.value.trim();
   if (!text || sending || !me || !peer) return;
-  sending = true; el.sendBtn.disabled = true; el.chatError.textContent = ""; el.msgInput.value = "";
+  forceBottom = true; sending = true; el.sendBtn.disabled = true; el.chatError.textContent = ""; el.msgInput.value = "";
   const chatId = chatIdFor(me.uid, peer.uid);
   try {
     // 1) send the message (this alone must succeed)
@@ -304,7 +406,7 @@ function buildPickers() {
   el.pEmojis.replaceChildren(); el.pColors.replaceChildren();
   ["", ...EMOJIS].forEach((em) => {
     const b = document.createElement("button"); b.type = "button"; b.dataset.v = em; b.textContent = em || "Aa";
-    b.title = em ? "Use this emoji" : "Use my initial"; b.onclick = () => { draft.emoji = em; previewDraft(); }; el.pEmojis.appendChild(b);
+    b.title = em ? "Use this emoji" : "Use my photo or initial"; b.onclick = () => { draft.emoji = em; previewDraft(); }; el.pEmojis.appendChild(b);
   });
   GRADS.forEach((g, i) => {
     const b = document.createElement("button"); b.type = "button"; b.dataset.v = i; b.style.background = g;
